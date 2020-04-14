@@ -49,6 +49,7 @@ import (
 	"github.com/projectcalico/felix/config"
 	_ "github.com/projectcalico/felix/config"
 	dp "github.com/projectcalico/felix/dataplane"
+	"github.com/projectcalico/felix/jitter"
 	"github.com/projectcalico/felix/logutils"
 	"github.com/projectcalico/felix/policysync"
 	"github.com/projectcalico/felix/proto"
@@ -62,9 +63,11 @@ import (
 	"github.com/projectcalico/libcalico-go/lib/backend/syncersv1/felixsyncer"
 	"github.com/projectcalico/libcalico-go/lib/backend/syncersv1/updateprocessors"
 	"github.com/projectcalico/libcalico-go/lib/backend/watchersyncer"
+	client "github.com/projectcalico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/libcalico-go/lib/errors"
 	"github.com/projectcalico/libcalico-go/lib/health"
 	lclogutils "github.com/projectcalico/libcalico-go/lib/logutils"
+	"github.com/projectcalico/libcalico-go/lib/options"
 	"github.com/projectcalico/libcalico-go/lib/set"
 	"github.com/projectcalico/pod2daemon/binder"
 	"github.com/projectcalico/typha/pkg/syncclient"
@@ -161,6 +164,7 @@ func Run(configFile string, gitVersion string, buildDate string, gitRevision str
 	// loop until the datastore is ready.
 	log.Info("Loading configuration...")
 	var backendClient bapi.Client
+	var v3Client client.Interface
 	var datastoreConfig apiconfig.CalicoAPIConfig
 	var configParams *config.Config
 	var typhaAddr string
@@ -321,10 +325,19 @@ configRetry:
 			continue configRetry
 		}
 
+		// create a v3 client for managing node resource.
+		v3Client, err = client.New(datastoreConfig)
+		if err != nil {
+			log.WithError(err).Error("Failed to connect to datastore")
+			time.Sleep(1 * time.Second)
+			continue configRetry
+		}
+		numClientsCreated++
+
 		break configRetry
 	}
 
-	if numClientsCreated > 2 {
+	if numClientsCreated > 3 {
 		// We don't have a way to close datastore connection so, if we reconnected after
 		// a failure to load config, restart felix to avoid leaking connections.
 		exitWithCustomRC(configChangedRC, "Restarting to avoid leaking datastore connections")
@@ -368,7 +381,7 @@ configRetry:
 		// (Otherwise, we pass in a nil channel, which disables such updates.)
 		connToUsageRepUpdChan = make(chan map[string]string, 1)
 	}
-	dpConnector := newConnector(configParams, connToUsageRepUpdChan, backendClient, dpDriver, failureReportChan)
+	dpConnector := newConnector(configParams, connToUsageRepUpdChan, backendClient, v3Client, dpDriver, failureReportChan)
 
 	// If enabled, create a server for the policy sync API.  This allows clients to connect to
 	// Felix over a socket and receive policy updates.
@@ -883,11 +896,14 @@ type DataplaneConnector struct {
 	failureReportChan          chan<- string
 	dataplane                  dp.DataplaneDriver
 	datastore                  bapi.Client
+	datastorev3                client.Interface
 	statusReporter             *statusrep.EndpointStatusReporter
 
 	datastoreInSync bool
 
 	firstStatusReportSent bool
+
+	wireguardStatUpdateMsg chan *proto.WireguardStatusUpdate
 }
 
 type Startable interface {
@@ -897,6 +913,7 @@ type Startable interface {
 func newConnector(configParams *config.Config,
 	configUpdChan chan<- map[string]string,
 	datastore bapi.Client,
+	datastorev3 client.Interface,
 	dataplane dp.DataplaneDriver,
 	failureReportChan chan<- string,
 ) *DataplaneConnector {
@@ -904,11 +921,13 @@ func newConnector(configParams *config.Config,
 		config:                     configParams,
 		configUpdChan:              configUpdChan,
 		datastore:                  datastore,
+		datastorev3:                datastorev3,
 		ToDataplane:                make(chan interface{}),
 		StatusUpdatesFromDataplane: make(chan interface{}),
 		InSync:                     make(chan bool, 1),
 		failureReportChan:          failureReportChan,
 		dataplane:                  dataplane,
+		wireguardStatUpdateMsg:     make(chan *proto.WireguardStatusUpdate, 1),
 	}
 	return felixConn
 }
@@ -945,6 +964,8 @@ func (fc *DataplaneConnector) readMessagesFromDataplane() {
 			if fc.statusReporter != nil {
 				fc.StatusUpdatesFromDataplane <- msg
 			}
+		case *proto.WireguardStatusUpdate:
+			fc.handleWireguardStatusUpdate(ctx, msg)
 		default:
 			log.WithField("msg", msg).Warning("Unknown message from dataplane")
 		}
@@ -986,6 +1007,85 @@ func (fc *DataplaneConnector) handleProcessStatusUpdate(ctx context.Context, msg
 	cancel()
 	if err != nil {
 		log.Warningf("Failed to write status to datastore: %v", err)
+	}
+}
+
+func (fc *DataplaneConnector) handleWireguardStatusUpdate(ctx context.Context, msg *proto.WireguardStatusUpdate) {
+	log.Debugf("Status update from dataplane driver: %v", *msg)
+
+	// read v3 node resource.
+	getCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	node, err := fc.datastorev3.Nodes().Get(getCtx, fc.config.FelixHostname, options.GetOptions{})
+	defer cancel()
+	if err != nil {
+		if msg.PublicKey != "" {
+			// Treat node read failure seriously here. Without node resource,
+			// we cannot publish public-key for other nodes.
+			log.Panicf("Failed to read v3 node resource: %v", err)
+		} else {
+			log.Warningf("Failed to read node resource: %v", err)
+			return
+		}
+	}
+
+	// Disabled Wireguard configuration if the public-key sent from dataplane is empty.
+	if msg.PublicKey == "" {
+		fc.config.WireguardEnabled = false
+	}
+
+	storedPublicKey := node.Status.PublicKey
+	// Check if the public-key needs to be "healed"
+	if storedPublicKey != msg.PublicKey {
+		log.Infof("Updating public-key from %s to %s", storedPublicKey, msg.PublicKey)
+		// Send the new public-key to write to node resource.
+		fc.wireguardStatUpdateMsg <- msg
+	}
+}
+
+// Write wireguard status to datastore.
+func (fc *DataplaneConnector) writeWireguardStatusToNode() {
+	var statusMsg *proto.WireguardStatusUpdate
+	var ticker *jitter.Ticker
+	node := &apiv3.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fc.config.FelixHostname,
+		},
+	}
+
+	for {
+		select {
+		// Check if there is a new update to write
+		case statusMsg = <-fc.wireguardStatUpdateMsg:
+			log.Debugf("received %v from dataplane", statusMsg)
+		// retry recoverable status update
+		case <-ticker.C:
+			log.Debug("retrying node resource update")
+		}
+
+		// cancel ticker if status is updated or ticker notified
+		if ticker != nil {
+			ticker.Stop()
+			ticker = nil
+		}
+
+		updateCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		node.Status = apiv3.NodeStatus{
+			PublicKey: statusMsg.PublicKey,
+		}
+		_, err := fc.datastorev3.Nodes().Update(updateCtx, node, options.SetOptions{})
+		cancel()
+		if err != nil {
+			// check if failure is recoverable
+			switch err.(type) {
+			case cerrors.ErrorValidation:
+			case cerrors.ErrorConnectionUnauthorized:
+				log.Errorf("Failed to update node resource: %v, giving up", err)
+				break
+			default:
+				log.Warnf("Failed to update node resource: %v", err)
+				ticker = jitter.NewTicker(2*time.Second, 4*time.Second)
+			}
+		}
 	}
 }
 
@@ -1084,6 +1184,9 @@ func (fc *DataplaneConnector) Start() {
 
 	// Start background thread to read messages from dataplane driver.
 	go fc.readMessagesFromDataplane()
+
+	// Start a background thread to handle Wireguard update to Node.
+	go fc.writeWireguardStatusToNode()
 }
 
 var ErrServiceNotReady = errors.New("Kubernetes service missing IP or port.")
