@@ -43,7 +43,7 @@ require (
 )
 
 replace (
-	github.com/projectcalico/libcalico-go => github.com/realgaurav/libcalico-go v1.7.2-0.20200415172853-4d5f77f8526e
+	github.com/projectcalico/libcalico-go => github.com/realgaurav/libcalico-go v1.7.2-0.20200420162617-82df7101904d
 	github.com/sirupsen/logrus => github.com/projectcalico/logrus v0.0.0-20180701205716-fc9bbf2f5799
 
 	k8s.io/api v0.0.0 => k8s.io/api v0.0.0-20191016110408-35e52d86657a

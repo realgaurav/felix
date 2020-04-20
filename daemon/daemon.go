@@ -334,6 +334,13 @@ configRetry:
 		}
 		numClientsCreated++
 
+		// Check v3 node resource.
+		_, err = v3Client.Nodes().Get(ctx, configParams.FelixHostname, options.GetOptions{})
+		if err != nil {
+			// Disable Wireguard if the v3 node resource is not available.
+			configParams.WireguardEnabled = false
+		}
+
 		break configRetry
 	}
 
@@ -903,7 +910,7 @@ type DataplaneConnector struct {
 
 	firstStatusReportSent bool
 
-	wireguardStatUpdateMsg chan *proto.WireguardStatusUpdate
+	wireguardStatUpdateFromDataplane chan *proto.WireguardStatusUpdate
 }
 
 type Startable interface {
@@ -918,16 +925,16 @@ func newConnector(configParams *config.Config,
 	failureReportChan chan<- string,
 ) *DataplaneConnector {
 	felixConn := &DataplaneConnector{
-		config:                     configParams,
-		configUpdChan:              configUpdChan,
-		datastore:                  datastore,
-		datastorev3:                datastorev3,
-		ToDataplane:                make(chan interface{}),
-		StatusUpdatesFromDataplane: make(chan interface{}),
-		InSync:                     make(chan bool, 1),
-		failureReportChan:          failureReportChan,
-		dataplane:                  dataplane,
-		wireguardStatUpdateMsg:     make(chan *proto.WireguardStatusUpdate, 1),
+		config:                           configParams,
+		configUpdChan:                    configUpdChan,
+		datastore:                        datastore,
+		datastorev3:                      datastorev3,
+		ToDataplane:                      make(chan interface{}),
+		StatusUpdatesFromDataplane:       make(chan interface{}),
+		InSync:                           make(chan bool, 1),
+		failureReportChan:                failureReportChan,
+		dataplane:                        dataplane,
+		wireguardStatUpdateFromDataplane: make(chan *proto.WireguardStatusUpdate, 1),
 	}
 	return felixConn
 }
@@ -965,7 +972,7 @@ func (fc *DataplaneConnector) readMessagesFromDataplane() {
 				fc.StatusUpdatesFromDataplane <- msg
 			}
 		case *proto.WireguardStatusUpdate:
-			fc.handleWireguardStatusUpdate(ctx, msg)
+			fc.wireguardStatUpdateFromDataplane <- msg
 		default:
 			log.WithField("msg", msg).Warning("Unknown message from dataplane")
 		}
@@ -1010,81 +1017,81 @@ func (fc *DataplaneConnector) handleProcessStatusUpdate(ctx context.Context, msg
 	}
 }
 
-func (fc *DataplaneConnector) handleWireguardStatusUpdate(ctx context.Context, msg *proto.WireguardStatusUpdate) {
-	log.Debugf("Status update from dataplane driver: %v", *msg)
-
-	// read v3 node resource.
-	getCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+func (fc *DataplaneConnector) reconcileWireguardStatUpdate(dpPubKey string) error {
+	// Read node resource from datastore and compare it with the publicKey from dataplane.
+	getCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	node, err := fc.datastorev3.Nodes().Get(getCtx, fc.config.FelixHostname, options.GetOptions{})
 	defer cancel()
 	if err != nil {
-		if msg.PublicKey != "" {
-			// Treat node read failure seriously here. Without node resource,
-			// we cannot publish public-key for other nodes.
-			log.Panicf("Failed to read v3 node resource: %v", err)
-		} else {
-			log.Warningf("Failed to read node resource: %v", err)
-			return
+		switch err.(type) {
+		case cerrors.ErrorConnectionUnauthorized:
+			log.Errorf("Reading node resource failed, cannot recover: %v", err)
+			// return nil to avoid retrying.
+			return nil
+		case cerrors.ErrorResourceDoesNotExist:
+			// Treat severely, if datastore read was successful but the node resource is empty.
+			log.Panic("v3 node resource must exist for Wireguard.")
 		}
+		// return error here so we can retry.
+		log.Warnf("Failed to read node resource: %v", err)
+		return err
 	}
 
-	// Disabled Wireguard configuration if the public-key sent from dataplane is empty.
-	if msg.PublicKey == "" {
-		fc.config.WireguardEnabled = false
-	}
-
-	storedPublicKey := node.Status.PublicKey
-	// Check if the public-key needs to be "healed"
-	if storedPublicKey != msg.PublicKey {
-		log.Infof("Updating public-key from %s to %s", storedPublicKey, msg.PublicKey)
-		// Send the new public-key to write to node resource.
-		fc.wireguardStatUpdateMsg <- msg
-	}
-}
-
-// Write wireguard status to datastore.
-func (fc *DataplaneConnector) writeWireguardStatusToNode() {
-	var statusMsg *proto.WireguardStatusUpdate
-	var ticker *jitter.Ticker
-	node := &apiv3.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fc.config.FelixHostname,
-		},
-	}
-
-	for {
-		select {
-		// Check if there is a new update to write
-		case statusMsg = <-fc.wireguardStatUpdateMsg:
-			log.Debugf("received %v from dataplane", statusMsg)
-		// retry recoverable status update
-		case <-ticker.C:
-			log.Debug("retrying node resource update")
-		}
-
-		// cancel ticker if status is updated or ticker notified
-		if ticker != nil {
-			ticker.Stop()
-			ticker = nil
-		}
-
+	// Check if the public-key needs to be updated.
+	storedPublicKey := node.Status.WireguardPublicKey
+	if storedPublicKey != dpPubKey {
 		updateCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		node.Status = apiv3.NodeStatus{
-			PublicKey: statusMsg.PublicKey,
-		}
+		node.Status.WireguardPublicKey = dpPubKey
 		_, err := fc.datastorev3.Nodes().Update(updateCtx, node, options.SetOptions{})
-		cancel()
+		defer cancel()
 		if err != nil {
 			// check if failure is recoverable
 			switch err.(type) {
 			case cerrors.ErrorValidation:
+			case cerrors.ErrorResourceUpdateConflict:
 			case cerrors.ErrorConnectionUnauthorized:
-				log.Errorf("Failed to update node resource: %v, giving up", err)
-				break
-			default:
-				log.Warnf("Failed to update node resource: %v", err)
-				ticker = jitter.NewTicker(2*time.Second, 4*time.Second)
+				log.Errorf("Updating node resource failed, cannot recover: %v", err)
+				// returning nil to avoid retrying.
+				return nil
 			}
+			// retry
+			log.Warnf("Failed updating node resource: %v", err)
+			return err
+		}
+		log.Debugf("Updated Wireguard public-key from %s to %s", storedPublicKey, dpPubKey)
+	}
+
+	return nil
+}
+
+func (fc *DataplaneConnector) handleWireguardStatUpdateFromDataplane() {
+	var current *proto.WireguardStatusUpdate
+	var ticker *jitter.Ticker
+
+	for {
+		if current == nil {
+			// Block until we get an update
+			current = <-fc.wireguardStatUpdateFromDataplane
+			log.Debugf("Wireguard status update from dataplane driver: %v", *current)
+		} else {
+			// Block until we either get an update or it's time to retry a failed update.
+			select {
+			case current = <-fc.wireguardStatUpdateFromDataplane:
+				log.Debugf("Wireguard status update from dataplane driver: %v", *current)
+				// Current updated from the
+			case <-ticker.C:
+				log.Debug("retrying failed Wireguard status update")
+			}
+			ticker.Stop()
+		}
+
+		// Try and reconcile the current wireguard status data.
+		err := fc.reconcileWireguardStatUpdate(current.PublicKey)
+		if err == nil {
+			current = nil
+		} else {
+			// retry reconciling between 2-4 seconds.
+			ticker = jitter.NewTicker(2*time.Second, 2*time.Second)
 		}
 	}
 }
@@ -1186,7 +1193,7 @@ func (fc *DataplaneConnector) Start() {
 	go fc.readMessagesFromDataplane()
 
 	// Start a background thread to handle Wireguard update to Node.
-	go fc.writeWireguardStatusToNode()
+	go fc.handleWireguardStatUpdateFromDataplane()
 }
 
 var ErrServiceNotReady = errors.New("Kubernetes service missing IP or port.")
