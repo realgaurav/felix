@@ -326,13 +326,6 @@ configRetry:
 			continue configRetry
 		}
 
-		// Check v3 node resource.
-		_, err = v3Client.Nodes().Get(ctx, configParams.FelixHostname, options.GetOptions{})
-		if err != nil {
-			// Disable Wireguard if the v3 node resource is not available.
-			configParams.WireguardEnabled = false
-		}
-
 		break configRetry
 	}
 
@@ -1018,55 +1011,52 @@ func (fc *DataplaneConnector) handleProcessStatusUpdate(ctx context.Context, msg
 }
 
 func (fc *DataplaneConnector) reconcileWireguardStatUpdate(dpPubKey string) error {
-	var retries int
-
-loop:
-	// Read node resource from datastore and compare it with the publicKey from dataplane.
-	getCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	node, err := fc.datastorev3.Nodes().Get(getCtx, fc.config.FelixHostname, options.GetOptions{})
-	defer cancel()
-	if err != nil {
-		switch err.(type) {
-		case cerrors.ErrorResourceDoesNotExist:
-			if dpPubKey != "" {
-				// If the node doesn't exist but non-empty public-key need to be set.
-				log.Panic("v3 node resource must exist for Wireguard.")
-			} else {
-				// No node with empty dataplane update implies node resource
-				// doesn't need to be processed further.
-				log.Debug("v3 node resource doesn't need any update")
-				return nil
-			}
-		}
-		// return error here so we can retry.
-		log.WithError(err).Info("Failed to read node resource")
-		return err
-	}
-
-	// Check if the public-key needs to be updated.
-	storedPublicKey := node.Status.WireguardPublicKey
-	if storedPublicKey != dpPubKey {
-		updateCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		node.Status.WireguardPublicKey = dpPubKey
-		_, err := fc.datastorev3.Nodes().Update(updateCtx, node, options.SetOptions{})
-		defer cancel()
+	// In case of a recoverable failure (ErrorResourceUpdateConflict), retry update 3 times.
+	for iter := 0; iter < 3; iter++ {
+		// Read node resource from datastore and compare it with the publicKey from dataplane.
+		getCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		node, err := fc.datastorev3.Nodes().Get(getCtx, fc.config.FelixHostname, options.GetOptions{})
+		cancel()
 		if err != nil {
-			// check if failure is recoverable
 			switch err.(type) {
-			case cerrors.ErrorResourceUpdateConflict:
-				if retries < 3 {
-					log.Debug("Update conflict, retrying update")
-					retries++
-					goto loop
+			case cerrors.ErrorResourceDoesNotExist:
+				if dpPubKey != "" {
+					// If the node doesn't exist but non-empty public-key need to be set.
+					log.Panic("v3 node resource must exist for Wireguard.")
+				} else {
+					// No node with empty dataplane update implies node resource
+					// doesn't need to be processed further.
+					log.Debug("v3 node resource doesn't need any update")
+					return nil
 				}
 			}
-			// retry
-			log.WithError(err).Info("Failed updating node resource")
+			// return error here so we can retry in some time.
+			log.WithError(err).Info("Failed to read node resource")
 			return err
 		}
-		log.Debugf("Updated Wireguard public-key from %s to %s", storedPublicKey, dpPubKey)
-	}
 
+		// Check if the public-key needs to be updated.
+		storedPublicKey := node.Status.WireguardPublicKey
+		if storedPublicKey != dpPubKey {
+			updateCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			node.Status.WireguardPublicKey = dpPubKey
+			_, err := fc.datastorev3.Nodes().Update(updateCtx, node, options.SetOptions{})
+			cancel()
+			if err != nil {
+				// check if failure is recoverable
+				switch err.(type) {
+				case cerrors.ErrorResourceUpdateConflict:
+					log.Debug("Update conflict, retrying update")
+					continue
+				}
+				// retry in some time.
+				log.WithError(err).Info("Failed updating node resource")
+				return err
+			}
+			log.Debugf("Updated Wireguard public-key from %s to %s", storedPublicKey, dpPubKey)
+		}
+		break
+	}
 	return nil
 }
 
@@ -1084,7 +1074,6 @@ func (fc *DataplaneConnector) handleWireguardStatUpdateFromDataplane() {
 			select {
 			case current = <-fc.wireguardStatUpdateFromDataplane:
 				log.Debugf("Wireguard status update from dataplane driver: %s", current.PublicKey)
-				// Current updated from the
 			case <-ticker.C:
 				log.Debug("retrying failed Wireguard status update")
 			}
