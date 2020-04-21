@@ -221,7 +221,7 @@ configRetry:
 		datastoreConfig = configParams.DatastoreConfig()
 		// Can't dump the whole config because it may have sensitive information...
 		log.WithField("datastore", datastoreConfig.Spec.DatastoreType).Info("Connecting to datastore")
-		backendClient, err = backend.NewClient(datastoreConfig)
+		v3Client, err = client.New(datastoreConfig)
 		if err != nil {
 			log.WithError(err).Error("Failed to create datastore client")
 			time.Sleep(1 * time.Second)
@@ -229,6 +229,7 @@ configRetry:
 		}
 		log.Info("Created datastore client")
 		numClientsCreated++
+		backendClient = v3Client.(interface{ Backend() bapi.Client }).Backend()
 		for {
 			globalConfig, hostConfig, err := loadConfigFromDatastore(
 				ctx, backendClient, configParams.FelixHostname)
@@ -325,15 +326,6 @@ configRetry:
 			continue configRetry
 		}
 
-		// create a v3 client for managing node resource.
-		v3Client, err = client.New(datastoreConfig)
-		if err != nil {
-			log.WithError(err).Error("Failed to connect to datastore")
-			time.Sleep(1 * time.Second)
-			continue configRetry
-		}
-		numClientsCreated++
-
 		// Check v3 node resource.
 		_, err = v3Client.Nodes().Get(ctx, configParams.FelixHostname, options.GetOptions{})
 		if err != nil {
@@ -344,7 +336,7 @@ configRetry:
 		break configRetry
 	}
 
-	if numClientsCreated > 3 {
+	if numClientsCreated > 2 {
 		// We don't have a way to close datastore connection so, if we reconnected after
 		// a failure to load config, restart felix to avoid leaking connections.
 		exitWithCustomRC(configChangedRC, "Restarting to avoid leaking datastore connections")
@@ -793,7 +785,7 @@ func loadConfigFromDatastore(
 	globalConfig = make(map[string]string)
 	var ready bool
 	err = getAndMergeConfig(
-		ctx, client, globalConfig,
+		ctx, client, globalConfig, nil,
 		apiv3.KindClusterInformation, "default",
 		updateprocessors.NewClusterInfoUpdateProcessor(),
 		&ready,
@@ -807,7 +799,7 @@ func loadConfigFromDatastore(
 		return
 	}
 	err = getAndMergeConfig(
-		ctx, client, globalConfig,
+		ctx, client, globalConfig, nil,
 		apiv3.KindFelixConfiguration, "default",
 		updateprocessors.NewFelixConfigUpdateProcessor(),
 		&ready,
@@ -816,7 +808,7 @@ func loadConfigFromDatastore(
 		return
 	}
 	err = getAndMergeConfig(
-		ctx, client, hostConfig,
+		ctx, client, hostConfig, nil,
 		apiv3.KindFelixConfiguration, "node."+hostname,
 		updateprocessors.NewFelixConfigUpdateProcessor(),
 		&ready,
@@ -825,7 +817,7 @@ func loadConfigFromDatastore(
 		return
 	}
 	err = getAndMergeConfig(
-		ctx, client, hostConfig,
+		ctx, client, hostConfig, map[string]string{"WireguardEnabled": "false"},
 		apiv3.KindNode, hostname,
 		updateprocessors.NewFelixNodeUpdateProcessor(),
 		&ready,
@@ -840,8 +832,12 @@ func loadConfigFromDatastore(
 // getAndMergeConfig gets the v3 resource configuration extracts the separate config values
 // (where each configuration value is stored in a field of the v3 resource Spec) and merges into
 // the supplied map, as required by our v1-style configuration loader.
+//
+// configOverrideIfResNotExist allows setting configuration value if the
+// queried resource doesn't exist.
 func getAndMergeConfig(
 	ctx context.Context, client bapi.Client, config map[string]string,
+	configOverrideIfResNotExist map[string]string,
 	kind string, name string,
 	configConverter watchersyncer.SyncerUpdateProcessor,
 	ready *bool,
@@ -857,6 +853,10 @@ func getAndMergeConfig(
 		switch err.(type) {
 		case cerrors.ErrorResourceDoesNotExist:
 			logCxt.Info("No config of this type")
+			for k, v := range configOverrideIfResNotExist {
+				logCxt.Debug("Overriding config, setting %s = %s", k, v)
+				config[k] = v
+			}
 			return nil
 		default:
 			logCxt.WithError(err).Info("Failed to load config from datastore")
@@ -1018,22 +1018,28 @@ func (fc *DataplaneConnector) handleProcessStatusUpdate(ctx context.Context, msg
 }
 
 func (fc *DataplaneConnector) reconcileWireguardStatUpdate(dpPubKey string) error {
+	var retries int
+
+loop:
 	// Read node resource from datastore and compare it with the publicKey from dataplane.
 	getCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	node, err := fc.datastorev3.Nodes().Get(getCtx, fc.config.FelixHostname, options.GetOptions{})
 	defer cancel()
 	if err != nil {
 		switch err.(type) {
-		case cerrors.ErrorConnectionUnauthorized:
-			log.Errorf("Reading node resource failed, cannot recover: %v", err)
-			// return nil to avoid retrying.
-			return nil
 		case cerrors.ErrorResourceDoesNotExist:
-			// Treat severely, if datastore read was successful but the node resource is empty.
-			log.Panic("v3 node resource must exist for Wireguard.")
+			if dpPubKey != "" {
+				// If the node doesn't exist but non-empty public-key need to be set.
+				log.Panic("v3 node resource must exist for Wireguard.")
+			} else {
+				// No node with empty dataplane update implies node resource
+				// doesn't need to be processed further.
+				log.Debug("v3 node resource doesn't need any update")
+				return nil
+			}
 		}
 		// return error here so we can retry.
-		log.Warnf("Failed to read node resource: %v", err)
+		log.WithError(err).Info("Failed to read node resource")
 		return err
 	}
 
@@ -1047,15 +1053,15 @@ func (fc *DataplaneConnector) reconcileWireguardStatUpdate(dpPubKey string) erro
 		if err != nil {
 			// check if failure is recoverable
 			switch err.(type) {
-			case cerrors.ErrorValidation:
 			case cerrors.ErrorResourceUpdateConflict:
-			case cerrors.ErrorConnectionUnauthorized:
-				log.Errorf("Updating node resource failed, cannot recover: %v", err)
-				// returning nil to avoid retrying.
-				return nil
+				if retries < 3 {
+					log.Debug("Update conflict, retrying update")
+					retries++
+					goto loop
+				}
 			}
 			// retry
-			log.Warnf("Failed updating node resource: %v", err)
+			log.WithError(err).Info("Failed updating node resource")
 			return err
 		}
 		log.Debugf("Updated Wireguard public-key from %s to %s", storedPublicKey, dpPubKey)
@@ -1072,12 +1078,12 @@ func (fc *DataplaneConnector) handleWireguardStatUpdateFromDataplane() {
 		if current == nil {
 			// Block until we get an update
 			current = <-fc.wireguardStatUpdateFromDataplane
-			log.Debugf("Wireguard status update from dataplane driver: %v", *current)
+			log.Debugf("Wireguard status update from dataplane driver: %s", current.PublicKey)
 		} else {
 			// Block until we either get an update or it's time to retry a failed update.
 			select {
 			case current = <-fc.wireguardStatUpdateFromDataplane:
-				log.Debugf("Wireguard status update from dataplane driver: %v", *current)
+				log.Debugf("Wireguard status update from dataplane driver: %s", current.PublicKey)
 				// Current updated from the
 			case <-ticker.C:
 				log.Debug("retrying failed Wireguard status update")
