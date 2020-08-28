@@ -233,7 +233,7 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 				Match: Match().ProtocolNum(ProtoUDP).DestPorts(uint16(r.Config.WireguardListeningPort)).
 					DestIPSet(r.IPSetConfigV4.NameForMainIPSet(IPSetIDThisHostIPs)).
 					DestAddrType(AddrTypeLocal),
-				Action: SetMarkAction{Mark: r.WireguardFirewallMark},
+				Action:  SetMarkAction{Mark: r.WireguardFirewallMark},
 				Comment: []string{"Packets destined for local wireguard endpoint"},
 			},
 		)

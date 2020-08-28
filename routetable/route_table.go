@@ -745,7 +745,7 @@ func (r *RouteTable) createL3Route(linkAttrs *netlink.LinkAttrs, target Target) 
 		route.Src = r.deviceRouteSourceAddress
 	}
 
-	if target.GW != nil{
+	if target.GW != nil {
 		route.Gw = target.GW.AsNetIP()
 	}
 
